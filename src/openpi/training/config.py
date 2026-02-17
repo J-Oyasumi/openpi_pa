@@ -1,6 +1,8 @@
 """See _CONFIGS for the list of available configs."""
 
 import abc
+import json
+import os
 from collections.abc import Sequence
 import dataclasses
 import difflib
@@ -20,12 +22,18 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.robocasa_policy as robocasa_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
+import numpy as np
+
+import openpi.groot_utils.groot_openpi_dataset as _groot_openpi_dataset
+from robocasa.macros import DATASET_BASE_PATH
+from robocasa.utils.dataset_registry import DATASET_SOUP_REGISTRY
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -92,6 +100,13 @@ class DataConfig:
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
+    
+    # Action dimension for padding (used by Groot datasets)
+    action_dim: int | None = None
+    
+    # Multi-dataset support for Groot datasets
+    data_dirs: list[str] | None = None  # List of data directories for multi-dataset
+    dataset_weights: list[float] | None = None  # Weights for each dataset in multi-dataset
 
 
 class GroupFactory(Protocol):
@@ -140,7 +155,7 @@ class ModelTransformFactory(GroupFactory):
 @dataclasses.dataclass(frozen=True)
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
-    repo_id: str = tyro.MISSING
+    repo_id: str | None = None
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -153,11 +168,17 @@ class DataConfigFactory(abc.ABC):
     def create_base_config(self, assets_dirs: pathlib.Path) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
+        base = self.base_config or DataConfig()
+        # Preserve pre-supplied norm_stats; only load if not provided
+        existing_stats = base.norm_stats
+        loaded_stats = None if existing_stats is not None else self._load_norm_stats(
+            epath.Path(self.assets.assets_dir or assets_dirs), asset_id
+        )
         return dataclasses.replace(
-            self.base_config or DataConfig(),
+            base,
             repo_id=repo_id,
             asset_id=asset_id,
-            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
+            norm_stats=existing_stats if existing_stats is not None else loaded_stats,
         )
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
@@ -169,7 +190,13 @@ class DataConfigFactory(abc.ABC):
             logging.info(f"Loaded norm stats from {data_assets_dir}")
             return norm_stats
         except FileNotFoundError:
-            logging.info(f"Norm stats not found in {data_assets_dir}, skipping.")
+            logging.info(f"Norm stats not found in {data_assets_dir}.")
+            # Fallback: try to read and convert stats from repo meta
+            # TODO: fix
+            converted = _groot_openpi_dataset._convert_stats_from_repo_meta(asset_id)
+            if converted is not None:
+                logging.info(f"Converted norm stats from repo meta for {asset_id}")
+                return converted
         return None
 
 
@@ -381,6 +408,57 @@ class RLDSDroidDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotRobocasaDataConfig(DataConfigFactory):
+    """Config for training on Groot datasets."""
+    
+    repo_id: str | None = None
+    
+    data_dirs: Any | None = None
+    dataset_weights: list[float] | None = None
+    
+    action_dim: int | None = None
+    
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group()
+
+        data_transforms = _transforms.Group(
+            inputs=[robocasa_policy.RobocasaInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[robocasa_policy.RobocasaOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        base = self.create_base_config(assets_dirs)
+
+        # Fallback: if norm_stats not found via assets/repo meta, combine from all data_dirs
+        fallback_norm_stats = None
+        if base.norm_stats is None and self.data_dirs and len(self.data_dirs) > 0:
+            if len(self.data_dirs) == 1:
+                d = self.data_dirs[0]
+                norm_stats = _groot_openpi_dataset._load_norm_stats_from_groot_dataset(d)
+                if norm_stats is not None:
+                    fallback_norm_stats = norm_stats
+                    logging.info(f"Loaded norm stats from local data dir: {d}")
+            else:
+                norm_stats = _groot_openpi_dataset._load_norm_stats_from_groot_mixture_dataset(self.data_dirs)
+                if norm_stats is not None:
+                    fallback_norm_stats = norm_stats
+                    logging.info(f"Loaded combined norm stats from {len(self.data_dirs)} data dirs")
+ 
+        return dataclasses.replace(
+            base,
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_dim=model_config.action_dim,
+            data_dirs=self.data_dirs,
+            dataset_weights=self.dataset_weights,
+            norm_stats=base.norm_stats or fallback_norm_stats,
+        )
+
+
+@dataclasses.dataclass
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -728,6 +806,186 @@ _CONFIGS = [
         exp_name="debug",
         num_train_steps=10,
         wandb_enabled=False,
+    ),
+    #
+    # RoboCasa dataset configs.
+    #
+    TrainConfig(
+        name="pi0_robocasa_target50",
+        model=pi0.Pi0Config(
+            max_token_len=96,
+        ),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=DATASET_SOUP_REGISTRY["target50"],
+        ),
+	    weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=500000,
+        save_interval=5000,
+        keep_period=10000,
+        batch_size=64,
+        num_workers=4,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_finetune_target_atomic_seen",
+        model=pi0.Pi0Config(
+            max_token_len=96,
+        ),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=DATASET_SOUP_REGISTRY["target_atomic_seen"],
+        ),
+	    weight_loader=weight_loaders.CheckpointWeightLoader("INSERT_CKPTPOINT_HERE"),
+        num_train_steps=100000,
+        save_interval=5000,
+        keep_period=5000,
+        batch_size=64,
+        num_workers=4,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_finetune_target_composite_seen",
+        model=pi0.Pi0Config(
+            max_token_len=96,
+        ),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=DATASET_SOUP_REGISTRY["target_composite_seen"],
+        ),
+	    weight_loader=weight_loaders.CheckpointWeightLoader("INSERT_CKPTPOINT_HERE"),
+        num_train_steps=100000,
+        save_interval=5000,
+        keep_period=5000,
+        batch_size=64,
+        num_workers=4,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_finetune_target_composite_unseen",
+        model=pi0.Pi0Config(
+            max_token_len=96,
+        ),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=DATASET_SOUP_REGISTRY["target_composite_unseen"],
+        ),
+	    weight_loader=weight_loaders.CheckpointWeightLoader("INSERT_CKPTPOINT_HERE"),
+        num_train_steps=100000,
+        save_interval=5000,
+        keep_period=5000,
+        batch_size=64,
+        num_workers=4,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_target_atomic_seen",
+        model=pi0.Pi0Config(
+            max_token_len=96,
+        ),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=DATASET_SOUP_REGISTRY["target_atomic_seen"],
+        ),
+	    weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=100000,
+        save_interval=5000,
+        keep_period=10000,
+        batch_size=64,
+        num_workers=4,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_target_atomic_seen_random_weight_init",
+        model=pi0.Pi0Config(
+            max_token_len=96,
+        ),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=DATASET_SOUP_REGISTRY["target_atomic_seen"],
+        ),
+	    weight_loader=weight_loaders.NoOpWeightLoader(),
+        num_train_steps=100000,
+        save_interval=5000,
+        keep_period=10000,
+        batch_size=64,
+        num_workers=4,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_target_atomic_seen_paligemma_init",
+        model=pi0.Pi0Config(
+            max_token_len=96,
+        ),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=DATASET_SOUP_REGISTRY["target_atomic_seen"],
+        ),
+	    weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=100000,
+        save_interval=5000,
+        keep_period=10000,
+        batch_size=64,
+        num_workers=4,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_target_composite_seen",
+        model=pi0.Pi0Config(
+            max_token_len=96,
+        ),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=DATASET_SOUP_REGISTRY["target_composite_seen"],
+        ),
+	    weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=100000,
+        save_interval=5000,
+        keep_period=10000,
+        batch_size=64,
+        num_workers=4,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_target_composite_unseen",
+        model=pi0.Pi0Config(
+            max_token_len=96,
+        ),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=DATASET_SOUP_REGISTRY["target_composite_unseen"],
+        ),
+	    weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=100000,
+        save_interval=5000,
+        keep_period=10000,
+        batch_size=64,
+        num_workers=4,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_pretrain_human300_mg60",
+        model=pi0.Pi0Config(
+            max_token_len=96,
+        ),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=DATASET_SOUP_REGISTRY["pretrain_human300_mg60"],
+        ),
+	    weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=100000,
+            decay_lr=2.5e-6,
+        ),
+        num_train_steps=100000,
+        save_interval=5000,
+        keep_period=10000,
+        batch_size=64,
+        num_workers=4,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_pretrain_human300",
+        model=pi0.Pi0Config(
+            max_token_len=96,
+        ),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=DATASET_SOUP_REGISTRY["pretrain_human300"],
+        ),
+	    weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=100000,
+            decay_lr=2.5e-6,
+        ),
+        num_train_steps=100000,
+        save_interval=5000,
+        keep_period=10000,
+        batch_size=64,
+        num_workers=4,
     ),
 ]
 

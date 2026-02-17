@@ -12,6 +12,9 @@ import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
 import openpi.transforms as transforms
+import openpi.shared.normalize as _normalize
+
+import openpi.groot_utils.groot_openpi_dataset as _groot_openpi_dataset
 
 
 @dataclasses.dataclass
@@ -59,9 +62,22 @@ def create_trained_policy(
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
         # that the policy is using the same normalization stats as the original training process.
+        
+        # Soroush: change this code to load norm stats from files instead
         if data_config.asset_id is None:
-            raise ValueError("Asset id is required to load norm stats.")
-        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+            # norm stats are assumed to be located in checkpoint assets folder
+            norm_stats = _normalize.load(checkpoint_dir / "assets")
+            logging.info(f"Loaded norm stats from {str(checkpoint_dir / 'assets')}")
+            # data_dirs = data_config.data_dirs
+            # if len(data_dirs) == 1:
+            #     d = data_dirs[0]
+            #     norm_stats = _groot_openpi_dataset._load_norm_stats_from_groot_dataset(d)
+            #     logging.info(f"Loaded norm stats from local data dir: {d}")
+            # else:
+            #     norm_stats = _groot_openpi_dataset._load_norm_stats_from_groot_mixture_dataset(data_dirs)
+            #     logging.info(f"Loaded combined norm stats from {len(data_dirs)} data dirs")
+        else:
+            norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
 
     return _policy.Policy(
         model,

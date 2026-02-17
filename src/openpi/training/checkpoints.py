@@ -72,8 +72,11 @@ def save_state(
         # Save the normalization stats.
         data_config = data_loader.data_config()
         norm_stats = data_config.norm_stats
-        if norm_stats is not None and data_config.asset_id is not None:
-            _normalize.save(directory / data_config.asset_id, norm_stats)
+        if norm_stats is not None:
+            if data_config.asset_id is not None:
+                _normalize.save(directory / data_config.asset_id, norm_stats)
+            else:
+                _normalize.save(directory, norm_stats)
 
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():

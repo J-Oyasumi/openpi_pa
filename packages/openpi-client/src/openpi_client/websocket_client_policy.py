@@ -31,8 +31,17 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         while True:
             try:
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
+                # Allow long first-JIT on server without ping timeout. Defaults can be overridden via env.
+                import os
+                ping_interval = float(os.getenv("OPENPI_WS_PING_INTERVAL", "120"))
+                ping_timeout = float(os.getenv("OPENPI_WS_PING_TIMEOUT", "600"))
                 conn = websockets.sync.client.connect(
-                    self._uri, compression=None, max_size=None, additional_headers=headers
+                    self._uri,
+                    compression=None,
+                    max_size=None,
+                    additional_headers=headers,
+                    ping_interval=ping_interval,
+                    ping_timeout=ping_timeout,
                 )
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata
