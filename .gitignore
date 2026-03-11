@@ -171,3 +171,5 @@ cython_debug/
 # added by Soroush
 checkpoints
 MUJOCO_LOG.TXT
+logs/
+data

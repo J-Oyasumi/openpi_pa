@@ -23,6 +23,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.robocasa_policy as robocasa_policy
+import openpi.policies.yam_policy as yam_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -458,6 +459,55 @@ class LeRobotRobocasaDataConfig(DataConfigFactory):
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class LeRobotYAMDataConfig(DataConfigFactory):
+    """Config for training on Groot datasets."""
+    
+    repo_id: str | None = None
+    action_dim: int | None = None
+    data_dirs: Any | None = None
+    dataset_weights: list[float] | None = None
+    
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group()
+
+        data_transforms = _transforms.Group(
+            inputs=[yam_policy.YAMInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[yam_policy.YAMOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        base = self.create_base_config(assets_dirs)
+
+        # Fallback: if norm_stats not found via assets/repo meta, combine from all data_dirs
+        fallback_norm_stats = None
+        if base.norm_stats is None and self.data_dirs and len(self.data_dirs) > 0:
+            if len(self.data_dirs) == 1:
+                d = self.data_dirs[0]
+                norm_stats = _groot_openpi_dataset._load_norm_stats_from_groot_dataset(d)
+                if norm_stats is not None:
+                    fallback_norm_stats = norm_stats
+                    logging.info(f"Loaded norm stats from local data dir: {d}")
+            else:
+                norm_stats = _groot_openpi_dataset._load_norm_stats_from_groot_mixture_dataset(self.data_dirs)
+                if norm_stats is not None:
+                    fallback_norm_stats = norm_stats
+                    logging.info(f"Loaded combined norm stats from {len(self.data_dirs)} data dirs")
+ 
+        return dataclasses.replace(
+            base,
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_dim=model_config.action_dim,
+            data_dirs=self.data_dirs,
+            dataset_weights=self.dataset_weights,
+            norm_stats=base.norm_stats or fallback_norm_stats,
+        )
+
+
 @dataclasses.dataclass
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
@@ -810,6 +860,22 @@ _CONFIGS = [
     #
     # RoboCasa dataset configs.
     #
+    # TrainConfig(
+    #     name="pi0_robocasa_ours",
+    #     model=pi0.Pi0Config(
+    #         max_token_len=96,
+    #     ),
+    #     data=LeRobotRobocasaDataConfig(
+    #         data_dirs=DATASET_SOUP_REGISTRY["used_tasks_pretrain"],
+    #     ),
+	#     weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+    #     num_train_steps=10000,
+    #     save_interval=1000,
+    #     keep_period=10000,
+    #     batch_size=192,
+    #     num_workers=16,
+    #     log_interval=10,
+    # ),
     TrainConfig(
         name="pi0_robocasa_target50",
         model=pi0.Pi0Config(
@@ -985,6 +1051,28 @@ _CONFIGS = [
         save_interval=5000,
         keep_period=10000,
         batch_size=64,
+        num_workers=4,
+    ),
+    TrainConfig(
+        name="pi0_realworld_yam",
+        model=pi0.Pi0Config(
+            max_token_len=96,
+        ),
+        data=LeRobotYAMDataConfig(
+            action_dim=7,
+            data_dirs=["./data"]
+        ),
+	    weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=100000,
+            decay_lr=2.5e-6,
+        ),
+        num_train_steps=10000,
+        save_interval=1000,
+        keep_period=10000,
+        batch_size=32,
         num_workers=4,
     ),
 ]

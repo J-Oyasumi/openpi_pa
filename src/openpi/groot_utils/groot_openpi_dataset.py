@@ -52,9 +52,9 @@ class GrootOpenpiSingleDataset(LeRobotSingleDataset):
         action_horizon: int,
     ):        
         # this part copied from Abhi's DP codebasee
-        dataset_path = dataset_meta["path"]
+        dataset_path = "./data"
         dataset_path = pathlib.Path(dataset_path)
-        filter_key = dataset_meta["filter_key"]
+        filter_key = None
         delta_indices = list(range(0, action_horizon))
         delta_indices_obs = [0]
         modality_keys_dict = get_modality_keys(dataset_path)
@@ -96,23 +96,17 @@ class GrootOpenpiSingleDataset(LeRobotSingleDataset):
         item = super().__getitem__(index)
 
         state = np.concatenate([
-            item["state.end_effector_position_relative"],
-            item["state.end_effector_rotation_relative"],
-            item["state.base_position"],
-            item["state.base_rotation"],
-            item["state.gripper_qpos"],
+            item["state.state"],
         ], axis=1)
         actions = np.concatenate([
             item["action.end_effector_position"],
             item["action.end_effector_rotation"],
             item["action.gripper_close"],
-            item["action.base_motion"],
-            item["action.control_mode"],
         ], axis=1)
 
         new_item = {
-            "observation/image": item["video.robot0_agentview_left"][0],
-            "observation/wrist_image": item["video.robot0_eye_in_hand"][0],
+            "observation/image": item["video.exterior"][0],
+            "observation/wrist_image": item["video.exterior"][0],
             "observation/state": state[0],
             "actions": actions,
             "prompt": item["annotation.human.task_description"][0], # TODO: Soroush change this later to task_description
@@ -220,17 +214,11 @@ class GrootOpenpiMultiDataset(LeRobotMixtureDataset):
 
         state = np.concatenate([
             item["state.end_effector_position_relative"],
-            item["state.end_effector_rotation_relative"],
-            item["state.base_position"],
-            item["state.base_rotation"],
-            item["state.gripper_qpos"],
         ], axis=1)
         actions = np.concatenate([
             item["action.end_effector_position"],
             item["action.end_effector_rotation"],
             item["action.gripper_close"],
-            item["action.base_motion"],
-            item["action.control_mode"],
         ], axis=1)
 
         new_item = {
@@ -251,7 +239,7 @@ def _load_norm_stats_from_groot_dataset(ds_meta: dict) -> dict[str, _transforms.
     def pad_ones(input, targ_len):
         return np.concatenate([input, np.ones(targ_len - len(input))])
     
-    dataset_path = ds_meta["path"]
+    dataset_path = "./data"
     dataset_path = pathlib.Path(dataset_path)
     path = dataset_path / "meta" / "stats.json"
     data = json.loads(path.read_text())
@@ -272,13 +260,9 @@ def _load_norm_stats_from_groot_dataset(ds_meta: dict) -> dict[str, _transforms.
     "state.gripper_qpos" 14, 15
     """
     raw_states_stats = data["observation.state"]
-    raw_states_mean = np.array(raw_states_stats["mean"])
-    raw_states_std = np.array(raw_states_stats["std"])
+    states_mean = np.array(raw_states_stats["mean"])
+    states_std = np.array(raw_states_stats["std"])
 
-    # HACK: choose appropriate state indices
-    states_indices = [7, 8, 9, 10, 11, 12, 13, 0, 1, 2, 3, 4, 5, 6, 14, 15]
-    states_mean = raw_states_mean[states_indices]
-    states_std = raw_states_std[states_indices]
 
     states_stats = _normalize.NormStats(
         mean=pad_zeros(states_mean, targ_len=32),
@@ -301,13 +285,9 @@ def _load_norm_stats_from_groot_dataset(ds_meta: dict) -> dict[str, _transforms.
     "action.control_mode" 4
     """
     raw_actions_stats = data["action"]
-    raw_actions_mean = np.array(raw_actions_stats["mean"])
-    raw_actions_std = np.array(raw_actions_stats["std"])
-    
-    # HACK: choose appropriate action indices
-    actions_indices = [5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4]
-    actions_mean = raw_actions_mean[actions_indices]
-    actions_std = raw_actions_std[actions_indices]
+    actions_mean = np.array(raw_actions_stats["mean"])
+    actions_std = np.array(raw_actions_stats["std"])
+
 
     actions_stats = _normalize.NormStats(
         mean=pad_zeros(actions_mean, targ_len=32),
